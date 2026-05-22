@@ -2,54 +2,19 @@ import streamlit as st
 import requests
 import time
 import pandas as pd
+from datetime import datetime, date
 
-# ── Configuração da página ──────────────────────────────────
 st.set_page_config(
     page_title="Solana Trader Scanner",
     page_icon="🔍",
     layout="wide"
 )
 
-# ── CSS customizado ─────────────────────────────────────────
 st.markdown("""
 <style>
-    .main { background-color: #0f1117; }
     .stApp { background-color: #0f1117; }
     h1 { color: #14F195 !important; font-family: monospace; }
     h2, h3 { color: #9945FF !important; font-family: monospace; }
-    .metric-card {
-        background: #1a1d2e;
-        border: 1px solid #2d2f45;
-        border-radius: 10px;
-        padding: 20px;
-        text-align: center;
-    }
-    .wallet-card {
-        background: #1a1d2e;
-        border: 1px solid #14F195;
-        border-radius: 8px;
-        padding: 15px;
-        margin: 8px 0;
-        font-family: monospace;
-    }
-    .tag {
-        background: #14F195;
-        color: #0f1117;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-size: 11px;
-        font-weight: bold;
-        margin-right: 4px;
-    }
-    .tag-purple {
-        background: #9945FF;
-        color: white;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-size: 11px;
-        font-weight: bold;
-        margin-right: 4px;
-    }
     .stTextInput > div > div > input {
         background-color: #1a1d2e;
         color: #ffffff;
@@ -67,12 +32,20 @@ st.markdown("""
         font-size: 16px;
         width: 100%;
     }
-    .stButton > button:hover {
-        opacity: 0.85;
-        border: none;
+    .stButton > button:hover { opacity: 0.85; }
+    .date-box {
+        background: #1a1d2e;
+        border: 1px solid #2d2f45;
+        border-radius: 8px;
+        padding: 12px 14px;
+        margin-top: 6px;
     }
-    div[data-testid="stProgress"] > div {
-        background-color: #14F195;
+    .date-label {
+        font-size: 11px;
+        color: #888;
+        letter-spacing: 0.08em;
+        margin-bottom: 6px;
+        font-family: monospace;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -127,7 +100,7 @@ def get_token_name(mint):
                 meta = data[0]
                 sym  = meta.get("onChainMetadata",{}).get("metadata",{}).get("data",{}).get("symbol","")
                 name = meta.get("onChainMetadata",{}).get("metadata",{}).get("data",{}).get("name","")
-                if sym: return f"{sym}", f"{name}"
+                if sym: return sym, name
     except: pass
     return mint[:8]+"…", "Token desconhecido"
 
@@ -142,45 +115,80 @@ def is_real_wallet(addr):
     except:
         return True
 
-def extrair_compradores(mint, label, log_area, prog_bar, prog_text):
+def extrair_compradores(mint, label, ts_from, ts_to, prog_text):
+    """
+    ts_from / ts_to: unix timestamps (int) ou None = sem limite
+    Para de paginar quando a transação for mais antiga que ts_from.
+    """
     compradores = {}
     before      = None
     total_tx    = 0
     pagina      = 0
+    parou_por_data = False
 
     while True:
         pagina += 1
         try:
             batch = helius_txns(mint, before)
         except Exception as e:
-            log_area.warning(f"Erro pág {pagina}: {e} — tentando novamente...")
+            prog_text.warning(f"Erro pág {pagina}: {e} — aguardando 3s...")
             time.sleep(3)
-            try: batch = helius_txns(mint, before)
+            try:   batch = helius_txns(mint, before)
             except: break
 
-        if not batch: break
+        if not batch:
+            break
 
         total_tx += len(batch)
+        encontrados = 0
 
         for tx in batch:
             ts        = tx.get("timestamp", 0)
             fee_payer = tx.get("feePayer", "")
+
+            # Se a transação é mais antiga que o início do timeframe → para
+            if ts_from and ts < ts_from:
+                parou_por_data = True
+                break
+
+            # Se a transação é mais recente que o fim do timeframe → pula
+            if ts_to and ts > ts_to:
+                continue
+
             for tt in tx.get("tokenTransfers", []):
                 if tt.get("mint","") != mint: continue
                 dest   = tt.get("toUserAccount","")
                 amount = float(tt.get("tokenAmount", 0))
                 if not dest or dest in SKIP_PROGRAMS or dest == mint: continue
                 if dest != fee_payer: continue
+
                 if dest not in compradores:
                     compradores[dest] = {"count":0,"amount":0.0,"first":ts,"last":ts}
                 compradores[dest]["count"]  += 1
                 compradores[dest]["amount"] += amount
                 if ts < compradores[dest]["first"]: compradores[dest]["first"] = ts
                 if ts > compradores[dest]["last"]:  compradores[dest]["last"]  = ts
+                encontrados += 1
 
-        prog_text.text(f"📦 {label} — Página {pagina} | {total_tx} transações | {len(compradores)} traders encontrados")
+        # Monta string do período para o log
+        periodo = ""
+        if ts_from or ts_to:
+            f = datetime.fromtimestamp(ts_from).strftime("%d/%m/%Y") if ts_from else "início"
+            t = datetime.fromtimestamp(ts_to).strftime("%d/%m/%Y")   if ts_to   else "hoje"
+            periodo = f" | período: {f} → {t}"
 
-        if len(batch) < 100: break
+        prog_text.text(
+            f"📦 {label} — Pág {pagina} | {total_tx} txns analisadas | "
+            f"{len(compradores)} traders{periodo}"
+        )
+
+        if parou_por_data:
+            prog_text.text(f"📦 {label} — Limite de data atingido na pág {pagina}. ✅")
+            break
+
+        if len(batch) < 100:
+            break
+
         before = batch[-1]["signature"]
         time.sleep(0.3)
 
@@ -193,33 +201,80 @@ def time_ago(ts):
     if diff < 86400: return f"{diff//3600}h atrás"
     return f"{diff//86400}d atrás"
 
-# ── INTERFACE ───────────────────────────────────────────────
+def date_to_ts(d):
+    """Converte date → unix timestamp (início do dia, UTC)."""
+    if d is None: return None
+    return int(datetime(d.year, d.month, d.day, 0, 0, 0).timestamp())
+
+def date_to_ts_end(d):
+    """Converte date → unix timestamp (fim do dia, UTC)."""
+    if d is None: return None
+    return int(datetime(d.year, d.month, d.day, 23, 59, 59).timestamp())
+
+# ── HEADER ──────────────────────────────────────────────────
 st.markdown("# 🔍 Solana Trader Scanner")
 st.markdown("##### Encontre wallets que compraram múltiplos tokens — apenas traders reais")
 st.markdown("---")
 
+# ── INPUTS DOS 3 TOKENS ─────────────────────────────────────
 col1, col2, col3 = st.columns(3)
 
-with col1:
-    st.markdown("### Token 1")
-    mint1 = st.text_input("Contrato da Moeda 1", placeholder="Cole o endereço do contrato...", key="m1")
+def token_block(col, num):
+    with col:
+        st.markdown(f"### Token {num}")
+        mint = st.text_input(
+            f"Contrato do Token {num}",
+            placeholder="Cole o endereço do contrato...",
+            key=f"mint{num}"
+        )
+        st.markdown(
+            '<div class="date-label">⬇ FILTRAR POR DATA (opcional — deixe em branco para varrer tudo)</div>',
+            unsafe_allow_html=True
+        )
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            date_from = st.date_input(
+                "De",
+                value=None,
+                min_value=date(2020, 1, 1),
+                max_value=date.today(),
+                key=f"from{num}",
+                help="Data de início (inclusive). Deixe em branco para sem limite."
+            )
+        with dc2:
+            date_to = st.date_input(
+                "Até",
+                value=None,
+                min_value=date(2020, 1, 1),
+                max_value=date.today(),
+                key=f"to{num}",
+                help="Data de fim (inclusive). Deixe em branco para hoje."
+            )
 
-with col2:
-    st.markdown("### Token 2")
-    mint2 = st.text_input("Contrato da Moeda 2", placeholder="Cole o endereço do contrato...", key="m2")
+        # Botão Reset para limpar as datas
+        if st.button(f"🔄 Limpar datas", key=f"reset{num}"):
+            st.session_state[f"from{num}"] = None
+            st.session_state[f"to{num}"]   = None
+            st.rerun()
 
-with col3:
-    st.markdown("### Token 3")
-    mint3 = st.text_input("Contrato da Moeda 3", placeholder="Cole o endereço do contrato...", key="m3")
+        return mint, date_from, date_to
+
+mint1, from1, to1 = token_block(col1, 1)
+mint2, from2, to2 = token_block(col2, 2)
+mint3, from3, to3 = token_block(col3, 3)
 
 st.markdown("")
 run = st.button("🚀 Iniciar Scan")
 
 if run:
-    contratos = {"Token 1": mint1.strip(), "Token 2": mint2.strip(), "Token 3": mint3.strip()}
+    contratos = {
+        "Token 1": (mint1.strip(), date_to_ts(from1), date_to_ts_end(to1)),
+        "Token 2": (mint2.strip(), date_to_ts(from2), date_to_ts_end(to2)),
+        "Token 3": (mint3.strip(), date_to_ts(from3), date_to_ts_end(to3)),
+    }
 
     # Validação
-    erros = [l for l, m in contratos.items() if not m or len(m) < 30]
+    erros = [l for l,(m,_,_) in contratos.items() if not m or len(m) < 30]
     if erros:
         st.error(f"Preencha os contratos: {', '.join(erros)}")
         st.stop()
@@ -227,16 +282,13 @@ if run:
     st.markdown("---")
     st.markdown("## ⏳ Processando...")
 
-    # Progresso
     prog_bar  = st.progress(0)
     prog_text = st.empty()
-    log_area  = st.empty()
 
-    # Nomes dos tokens
+    # Nomes
     prog_text.text("Identificando tokens...")
-    nomes = {}
-    simbolos = {}
-    for label, mint in contratos.items():
+    nomes = {}; simbolos = {}
+    for label, (mint, _, _) in contratos.items():
         sym, name = get_token_name(mint)
         nomes[label]    = name
         simbolos[label] = sym
@@ -245,20 +297,20 @@ if run:
     compradores_por_token = {}
     labels = list(contratos.keys())
 
-    for i, (label, mint) in enumerate(contratos.items()):
-        log_area.info(f"Varrendo {label} ({simbolos[label]})...")
-        prog_bar.progress((i * 30) // 100)
+    for i, (label, (mint, ts_from, ts_to)) in enumerate(contratos.items()):
+        prog_bar.progress(int((i / 3) * 85))
+        f_str = datetime.fromtimestamp(ts_from).strftime("%d/%m/%Y") if ts_from else "início"
+        t_str = datetime.fromtimestamp(ts_to).strftime("%d/%m/%Y")   if ts_to   else "hoje"
+        prog_text.text(f"Varrendo {label} ({simbolos[label]}) — {f_str} → {t_str}...")
         compradores_por_token[label] = extrair_compradores(
-            mint, f"{label} ({simbolos[label]})", log_area, prog_bar, prog_text
+            mint, f"{label} ({simbolos[label]})", ts_from, ts_to, prog_text
         )
 
     prog_bar.progress(90)
-    prog_text.text("Calculando interseção e verificando carteiras...")
+    prog_text.text("Calculando interseção e verificando carteiras reais...")
 
-    sets = [set(compradores_por_token[l].keys()) for l in labels]
+    sets       = [set(compradores_por_token[l].keys()) for l in labels]
     intersecao = sets[0] & sets[1] & sets[2]
-
-    log_area.info(f"Interseção bruta: {len(intersecao)} endereços — verificando se são carteiras reais...")
 
     traders_confirmados = []
     for addr in intersecao:
@@ -268,9 +320,8 @@ if run:
 
     prog_bar.progress(100)
     prog_text.text("✅ Scan concluído!")
-    log_area.empty()
 
-    # ── MÉTRICAS ───────────────────────────────────────────
+    # ── MÉTRICAS ────────────────────────────────────────────
     st.markdown("---")
     st.markdown("## 📊 Resultado")
 
@@ -286,15 +337,14 @@ if run:
 
     st.markdown("")
     c1, c2 = st.columns(2)
-    c1.metric("🎯 Compraram as 3 moedas", len(traders_confirmados),
-              help="Wallets de traders reais que compraram os 3 tokens")
+    c1.metric("🎯 Compraram as 3 moedas", len(traders_confirmados))
     bonus_set = ((sets[0]&sets[1]) | (sets[0]&sets[2]) | (sets[1]&sets[2])) - (sets[0]&sets[1]&sets[2])
     c2.metric("⭐ Compraram 2 das 3", len(bonus_set))
 
-    # ── TABELA DE RESULTADOS ───────────────────────────────
+    # ── TABELA PRINCIPAL ────────────────────────────────────
     if traders_confirmados:
         st.markdown("---")
-        st.markdown(f"### 🎯 Wallets que compraram as 3 moedas ({len(traders_confirmados)})")
+        st.markdown(f"### 🎯 Wallets que compraram as 3 tokens ({len(traders_confirmados)})")
 
         rows = []
         for wallet in traders_confirmados:
@@ -302,20 +352,18 @@ if run:
             for label in labels:
                 info = compradores_por_token[label].get(wallet, {})
                 sym  = simbolos[label]
-                row[f"{sym} — Compras"]  = info.get("count", 0)
-                row[f"{sym} — Tokens"]   = f"{info.get('amount',0):,.0f}"
-                row[f"{sym} — Última"]   = time_ago(info.get("last", 0))
+                row[f"{sym} Compras"] = info.get("count", 0)
+                row[f"{sym} Tokens"]  = f"{info.get('amount',0):,.0f}"
+                row[f"{sym} Última"]  = time_ago(info.get("last", 0))
             row["Solscan"] = f"https://solscan.io/account/{wallet}"
             row["Birdeye"] = f"https://birdeye.so/profile/{wallet}?chain=solana"
             rows.append(row)
 
         df = pd.DataFrame(rows)
-
-        # Tabela interativa
         st.dataframe(
             df,
             column_config={
-                "Wallet": st.column_config.TextColumn("Wallet", width=200),
+                "Wallet":  st.column_config.TextColumn("Wallet", width=220),
                 "Solscan": st.column_config.LinkColumn("Solscan ↗"),
                 "Birdeye": st.column_config.LinkColumn("Birdeye ↗"),
             },
@@ -323,16 +371,9 @@ if run:
             hide_index=True,
         )
 
-        # Download CSV
         csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="⬇️ Baixar resultado em CSV",
-            data=csv,
-            file_name="traders_3_moedas.csv",
-            mime="text/csv",
-        )
+        st.download_button("⬇️ Baixar CSV", csv, "traders_3_tokens.csv", "text/csv")
 
-        # Cards individuais
         st.markdown("---")
         st.markdown("### 🃏 Detalhe por wallet")
         for wallet in traders_confirmados:
@@ -347,31 +388,31 @@ if run:
                         st.write(f"Compras: **{info.get('count',0)}**")
                         st.write(f"Tokens: **{info.get('amount',0):,.0f}**")
                         st.write(f"Última: **{time_ago(info.get('last',0))}**")
-                st.markdown(f"[🔗 Solscan](https://solscan.io/account/{wallet}) · "
-                            f"[🐦 Birdeye](https://birdeye.so/profile/{wallet}?chain=solana)")
+                st.markdown(
+                    f"[🔗 Solscan](https://solscan.io/account/{wallet}) · "
+                    f"[🐦 Birdeye](https://birdeye.so/profile/{wallet}?chain=solana)"
+                )
     else:
-        st.warning("Nenhuma wallet de trader real comprou as 3 moedas. Verifique os contratos.")
+        st.warning("Nenhuma wallet de trader real comprou as 3 tokens no período selecionado.")
 
-    # ── BÔNUS: 2 das 3 ─────────────────────────────────────
+    # ── BÔNUS 2 das 3 ───────────────────────────────────────
     if bonus_set:
         st.markdown("---")
-        st.markdown(f"### ⭐ Traders que compraram 2 das 3 moedas ({min(len(bonus_set),50)} mostrados)")
+        st.markdown(f"### ⭐ Traders que compraram 2 das 3 ({min(len(bonus_set),50)} mostrados)")
         bonus_traders = [a for a in list(bonus_set)[:50] if is_real_wallet(a)]
-
-        bonus_rows = []
-        for wallet in bonus_traders:
-            moedas_compradas = [simbolos[l] for j,l in enumerate(labels) if wallet in sets[j]]
-            bonus_rows.append({
-                "Wallet":   wallet,
-                "Comprou":  " + ".join(moedas_compradas),
-                "Solscan":  f"https://solscan.io/account/{wallet}",
-                "Birdeye":  f"https://birdeye.so/profile/{wallet}?chain=solana",
-            })
-
-        if bonus_rows:
-            df_bonus = pd.DataFrame(bonus_rows)
+        if bonus_traders:
+            bonus_rows = []
+            for wallet in bonus_traders:
+                moedas = [simbolos[l] for j,l in enumerate(labels) if wallet in sets[j]]
+                bonus_rows.append({
+                    "Wallet":  wallet,
+                    "Comprou": " + ".join(moedas),
+                    "Solscan": f"https://solscan.io/account/{wallet}",
+                    "Birdeye": f"https://birdeye.so/profile/{wallet}?chain=solana",
+                })
+            df2 = pd.DataFrame(bonus_rows)
             st.dataframe(
-                df_bonus,
+                df2,
                 column_config={
                     "Solscan": st.column_config.LinkColumn("Solscan ↗"),
                     "Birdeye": st.column_config.LinkColumn("Birdeye ↗"),
@@ -379,5 +420,5 @@ if run:
                 use_container_width=True,
                 hide_index=True,
             )
-            csv2 = df_bonus.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Baixar bônus CSV", csv2, "traders_2_moedas.csv", "text/csv")
+            csv2 = df2.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Baixar CSV bônus", csv2, "traders_2_tokens.csv", "text/csv")
